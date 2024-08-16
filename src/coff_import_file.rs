@@ -10,12 +10,13 @@ use std::path::PathBuf;
 use std::str::from_utf8;
 
 use object::pe::{
-    ImageFileHeader, ImageImportDescriptor, ImageRelocation, ImageSectionHeader, ImageSymbol,
-    ImportObjectHeader, IMAGE_FILE_32BIT_MACHINE, IMAGE_REL_AMD64_ADDR32NB,
-    IMAGE_REL_ARM64_ADDR32NB, IMAGE_REL_ARM_ADDR32NB, IMAGE_REL_I386_DIR32NB,
-    IMAGE_SCN_ALIGN_2BYTES, IMAGE_SCN_ALIGN_4BYTES, IMAGE_SCN_ALIGN_8BYTES,
-    IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_LNK_INFO, IMAGE_SCN_LNK_REMOVE, IMAGE_SCN_MEM_READ,
-    IMAGE_SCN_MEM_WRITE, IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_NULL, IMAGE_SYM_CLASS_SECTION,
+    ImageAuxSymbolSection, ImageFileHeader, ImageImportDescriptor, ImageRelocation,
+    ImageSectionHeader, ImageSymbol, ImportObjectHeader, IMAGE_COMDAT_SELECT_ANY,
+    IMAGE_FILE_32BIT_MACHINE, IMAGE_REL_AMD64_ADDR32NB, IMAGE_REL_ARM64_ADDR32NB,
+    IMAGE_REL_ARM_ADDR32NB, IMAGE_REL_I386_DIR32NB, IMAGE_SCN_ALIGN_2BYTES, IMAGE_SCN_ALIGN_4BYTES,
+    IMAGE_SCN_ALIGN_8BYTES, IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_LNK_COMDAT,
+    IMAGE_SCN_LNK_INFO, IMAGE_SCN_LNK_REMOVE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
+    IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_NULL, IMAGE_SYM_CLASS_SECTION,
     IMAGE_SYM_CLASS_STATIC, IMAGE_SYM_CLASS_WEAK_EXTERNAL, IMAGE_WEAK_EXTERN_SEARCH_ALIAS,
 };
 use object::pod::bytes_of;
@@ -463,11 +464,14 @@ impl<'a> ObjectFactory<'a> {
     /// Creates a NULL import descriptor.  This is a small object file whcih
     /// contains a NULL import descriptor.  It is used to terminate the imports
     /// from a specific DLL.
-    fn create_null_import_descriptor(&self) -> Result<NewArchiveMember<'_>> {
+    ///
+    /// If `comdat` is set to true, the NULL import descriptor's section (`.idata$3`) will be
+    /// turned into a COMDAT section.
+    fn create_null_import_descriptor(&self, comdat: bool) -> Result<NewArchiveMember<'_>> {
         let mut buffer = Vec::new();
 
         const NUMBER_OF_SECTIONS: usize = 1;
-        const NUMBER_OF_SYMBOLS: usize = 1;
+        let number_of_symbols = if comdat { 3 } else { 1 };
 
         // COFF Header
         let header = ImageFileHeader {
@@ -477,7 +481,7 @@ impl<'a> ObjectFactory<'a> {
             pointer_to_symbol_table: u32!((size_of::<ImageFileHeader>() + (NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>()) +
                 // .idata$3
                 size_of::<ImageImportDescriptor>()).try_into().unwrap()),
-            number_of_symbols: u32!(NUMBER_OF_SYMBOLS.try_into().unwrap()),
+            number_of_symbols: u32!(number_of_symbols.try_into().unwrap()),
             size_of_optional_header: u16!(0),
             characteristics: u16!(if self.is_64_bit() {
                 0
@@ -506,6 +510,7 @@ impl<'a> ObjectFactory<'a> {
                     | IMAGE_SCN_CNT_INITIALIZED_DATA
                     | IMAGE_SCN_MEM_READ
                     | IMAGE_SCN_MEM_WRITE
+                    | if comdat { IMAGE_SCN_LNK_COMDAT } else { 0 }
             ),
         }];
         buffer.write_all(bytes_of(&section_table))?;
@@ -521,16 +526,38 @@ impl<'a> ObjectFactory<'a> {
         buffer.write_all(bytes_of(&import_descriptor))?;
 
         // Symbol Table
-        let mut symbol_table: [_; NUMBER_OF_SYMBOLS] = [ImageSymbol {
+        if comdat {
+            let symbol = ImageSymbol {
+                name: *b".idata$3",
+                value: u32!(0),
+                section_number: u16!(1),
+                typ: u16!(0),
+                storage_class: IMAGE_SYM_CLASS_STATIC,
+                number_of_aux_symbols: 1,
+            };
+            let aux = ImageAuxSymbolSection {
+                length: u32!(size_of::<ImageImportDescriptor>().try_into().unwrap()),
+                number_of_relocations: u16!(0),
+                number_of_linenumbers: u16!(0),
+                check_sum: u32!(0),
+                selection: IMAGE_COMDAT_SELECT_ANY,
+                number: u16!(0),
+                reserved: 0,
+                high_number: u16!(0),
+            };
+            buffer.write_all(bytes_of(&symbol))?;
+            buffer.write_all(bytes_of(&aux))?;
+        }
+        let mut null_descriptor_symbol = ImageSymbol {
             name: [0; 8],
             value: u32!(0),
             section_number: u16!(1),
             typ: u16!(0),
             storage_class: IMAGE_SYM_CLASS_EXTERNAL,
             number_of_aux_symbols: 0,
-        }];
-        set_name_to_string_table_entry(&mut symbol_table[0], size_of::<u32>());
-        buffer.write_all(bytes_of(&symbol_table))?;
+        };
+        set_name_to_string_table_entry(&mut null_descriptor_symbol, size_of::<u32>());
+        buffer.write_all(bytes_of(&null_descriptor_symbol))?;
 
         // String Table
         write_string_table(&mut buffer, &[NULL_IMPORT_DESCRIPTOR_SYMBOL_NAME])?;
@@ -826,6 +853,7 @@ pub fn write_import_library<W: Write + Seek>(
     exports: &[COFFShortExport],
     machine: MachineTypes,
     mingw: bool,
+    comdat: bool,
 ) -> Result<()> {
     let native_machine = if machine == MachineTypes::ARM64EC {
         MachineTypes::ARM64
@@ -838,7 +866,7 @@ pub fn write_import_library<W: Write + Seek>(
 
     members.push(of.create_import_descriptor()?);
 
-    members.push(of.create_null_import_descriptor()?);
+    members.push(of.create_null_import_descriptor(comdat)?);
 
     members.push(of.create_null_thunk()?);
 
