@@ -5,8 +5,10 @@ use std::process::Command;
 
 use ar_archive_writer::{ArchiveKind, COFFShortExport, MachineTypes};
 use common::{create_archive_with_ar_archive_writer, create_archive_with_llvm_ar};
+use object::coff::CoffHeader;
+use object::pe::ImageFileHeader;
 use object::read::archive::ArchiveFile;
-use object::{Architecture, SubArchitecture};
+use object::{bytes_of, Architecture, Object, SubArchitecture, U32Bytes};
 use pretty_assertions::assert_eq;
 
 mod common;
@@ -99,6 +101,7 @@ fn create_import_library_with_ar_archive_writer(
     temp_dir: &Path,
     machine_type: MachineTypes,
     mingw: bool,
+    comdat: bool,
 ) -> Vec<u8> {
     let mut output_bytes = Cursor::new(Vec::new());
     ar_archive_writer::write_import_library(
@@ -107,6 +110,7 @@ fn create_import_library_with_ar_archive_writer(
         &get_members(machine_type),
         machine_type,
         mingw,
+        comdat,
     )
     .unwrap();
 
@@ -129,7 +133,7 @@ fn compare_to_lib() {
         let temp_dir = common::create_tmp_dir("import_library_compare_to_lib");
 
         let archive_writer_bytes =
-            create_import_library_with_ar_archive_writer(&temp_dir, machine_type, false);
+            create_import_library_with_ar_archive_writer(&temp_dir, machine_type, false, false);
 
         let llvm_lib_bytes = {
             let machine_arg = match machine_type {
@@ -164,6 +168,11 @@ fn compare_to_lib() {
             llvm_lib_bytes, archive_writer_bytes,
             "Import library differs. Machine type: {machine_type:?}",
         );
+
+        compare_comdat(
+            &create_import_library_with_ar_archive_writer(&temp_dir, machine_type, false, true),
+            &llvm_lib_bytes,
+        );
     }
 }
 
@@ -178,7 +187,7 @@ fn compare_to_dlltool() {
         let temp_dir = common::create_tmp_dir("import_library_compare_to_dlltool");
 
         let archive_writer_bytes =
-            create_import_library_with_ar_archive_writer(&temp_dir, machine_type, true);
+            create_import_library_with_ar_archive_writer(&temp_dir, machine_type, true, false);
 
         let llvm_lib_bytes = {
             let machine_arg = match machine_type {
@@ -215,6 +224,11 @@ fn compare_to_dlltool() {
             llvm_lib_bytes, archive_writer_bytes,
             "Import library differs. Machine type: {machine_type:?}",
         );
+
+        compare_comdat(
+            &create_import_library_with_ar_archive_writer(&temp_dir, machine_type, true, true),
+            &llvm_lib_bytes,
+        );
     }
 }
 
@@ -237,9 +251,10 @@ fn wrap_in_archive() {
         let mut import_lib_bytes = Cursor::new(Vec::new());
         ar_archive_writer::write_import_library(
             &mut import_lib_bytes,
-            &temp_dir.join("MyLibrary.dll").to_string_lossy().to_string(),
+            &temp_dir.join("MyLibrary.dll").to_string_lossy(),
             &get_members(machine_type),
             machine_type,
+            false,
             false,
         )
         .unwrap();
@@ -279,5 +294,63 @@ fn wrap_in_archive() {
             llvm_ar_archive, ar_archive_writer_archive,
             "Archives differ for architecture: {architecture:?}, subarch: {subarch:?}, machine type: {machine_type:?}",
         );
+    }
+}
+
+fn compare_comdat(archive_writer_bytes: &[u8], llvm_bytes: &[u8]) {
+    let archive_writer = ArchiveFile::parse(archive_writer_bytes).unwrap();
+    let llvm = ArchiveFile::parse(llvm_bytes).unwrap();
+
+    for (archive_member, llvm_member) in archive_writer.members().zip(llvm.members()) {
+        let archive_member = archive_member.unwrap();
+        let llvm_member = llvm_member.unwrap();
+
+        if archive_member.size() != llvm_member.size() {
+            // Ensure that the member header is the same except for the file size.
+            let mut llvm_file_header = *llvm_member.header().unwrap();
+            llvm_file_header.size = *b"163       ";
+            assert_eq!(
+                bytes_of(archive_member.header().unwrap()),
+                bytes_of(&llvm_file_header)
+            );
+
+            // Ensure that the LLVM generated object contains .idata$3
+            object::File::parse(llvm_member.data(llvm_bytes).unwrap())
+                .unwrap()
+                .section_by_name_bytes(b".idata$3")
+                .unwrap();
+
+            // Ensure the COFF file headers are the same except for the symbol count.
+            let llvm_data = llvm_member.data(llvm_bytes).unwrap();
+            let archive_data = archive_member.data(archive_writer_bytes).unwrap();
+            let mut offset = 0;
+            let mut header = *ImageFileHeader::parse(llvm_data, &mut offset).unwrap();
+            header.number_of_symbols = U32Bytes::from_bytes(3_u32.to_le_bytes());
+            assert_eq!(
+                &archive_data[..size_of::<ImageFileHeader>()],
+                bytes_of(&header)
+            );
+
+            // The rest of the object file will always be the same as `expected`
+            // for all import files no matter the platform.
+            let expected = [
+                46, 105, 100, 97, 116, 97, 36, 51, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 60, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 16, 48, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 46, 105, 100, 97, 116, 97, 36, 51, 0, 0, 0, 0, 1,
+                0, 0, 0, 3, 1, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+                4, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 29, 0, 0, 0, 95, 95, 78, 85, 76, 76, 95,
+                73, 77, 80, 79, 82, 84, 95, 68, 69, 83, 67, 82, 73, 80, 84, 79, 82, 0,
+            ];
+            assert_eq!(&archive_data[size_of::<ImageFileHeader>()..], &expected);
+        } else {
+            assert_eq!(
+                bytes_of(archive_member.header().unwrap()),
+                bytes_of(llvm_member.header().unwrap())
+            );
+            assert_eq!(
+                archive_member.data(archive_writer_bytes).unwrap(),
+                llvm_member.data(llvm_bytes).unwrap()
+            );
+        }
     }
 }
