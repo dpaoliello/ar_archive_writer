@@ -5,10 +5,10 @@ use std::process::Command;
 
 use ar_archive_writer::{ArchiveKind, COFFShortExport, MachineTypes};
 use common::{create_archive_with_ar_archive_writer, create_archive_with_llvm_ar};
-use object::coff::CoffHeader;
+use object::coff::CoffFile;
 use object::pe::ImageFileHeader;
 use object::read::archive::ArchiveFile;
-use object::{bytes_of, Architecture, Object, SubArchitecture, U32Bytes};
+use object::{bytes_of, Architecture, Object, ObjectSection, ObjectSymbol, SubArchitecture};
 use pretty_assertions::assert_eq;
 
 mod common;
@@ -305,43 +305,45 @@ fn compare_comdat(archive_writer_bytes: &[u8], llvm_bytes: &[u8]) {
         let archive_member = archive_member.unwrap();
         let llvm_member = llvm_member.unwrap();
 
+        // skip the EC symbols table.
+        if archive_member.name() == b"/<ECSYMBOLS>/" {
+            continue;
+        }
+
         if archive_member.size() != llvm_member.size() {
             // Ensure that the member header is the same except for the file size.
             let mut llvm_file_header = *llvm_member.header().unwrap();
-            llvm_file_header.size = *b"163       ";
+            llvm_file_header.size = archive_member.header().unwrap().size;
             assert_eq!(
                 bytes_of(archive_member.header().unwrap()),
                 bytes_of(&llvm_file_header)
             );
 
-            // Ensure that the LLVM generated object contains .idata$3
-            object::File::parse(llvm_member.data(llvm_bytes).unwrap())
-                .unwrap()
-                .section_by_name_bytes(b".idata$3")
-                .unwrap();
-
-            // Ensure the COFF file headers are the same except for the symbol count.
-            let llvm_data = llvm_member.data(llvm_bytes).unwrap();
+            // Make sure they are both COFF files with the same sections and symbols,
+            // except for the different naming for the null import descriptor.
             let archive_data = archive_member.data(archive_writer_bytes).unwrap();
-            let mut offset = 0;
-            let mut header = *ImageFileHeader::parse(llvm_data, &mut offset).unwrap();
-            header.number_of_symbols = U32Bytes::from_bytes(3_u32.to_le_bytes());
-            assert_eq!(
-                &archive_data[..size_of::<ImageFileHeader>()],
-                bytes_of(&header)
-            );
+            let llvm_data = llvm_member.data(llvm_bytes).unwrap();
+            let archive_file = CoffFile::<_, ImageFileHeader>::parse(archive_data).unwrap();
+            let llvm_file = CoffFile::<_, ImageFileHeader>::parse(llvm_data).unwrap();
 
-            // The rest of the object file will always be the same as `expected`
-            // for all import files no matter the platform.
-            let expected = [
-                46, 105, 100, 97, 116, 97, 36, 51, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 60, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 16, 48, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 46, 105, 100, 97, 116, 97, 36, 51, 0, 0, 0, 0, 1,
-                0, 0, 0, 3, 1, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
-                4, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 29, 0, 0, 0, 95, 95, 78, 85, 76, 76, 95,
-                73, 77, 80, 79, 82, 84, 95, 68, 69, 83, 67, 82, 73, 80, 84, 79, 82, 0,
-            ];
-            assert_eq!(&archive_data[size_of::<ImageFileHeader>()..], &expected);
+            for (archive_section, llvm_section) in archive_file.sections().zip(llvm_file.sections())
+            {
+                assert_eq!(archive_section.data(), llvm_section.data());
+            }
+            for (archive_symbol, llvm_symbol) in archive_file.symbols().zip(llvm_file.symbols()) {
+                if llvm_symbol.name().unwrap() == "__NULL_IMPORT_DESCRIPTOR" {
+                    assert!(archive_symbol
+                        .name()
+                        .unwrap()
+                        .starts_with("__NULL_IMPORT_DESCRIPTOR_"));
+                } else {
+                    assert_eq!(archive_symbol.name(), llvm_symbol.name());
+                }
+                let archive_coff_symbol = archive_symbol.coff_symbol();
+                let mut llvm_coff_symbol = *llvm_symbol.coff_symbol();
+                llvm_coff_symbol.name = archive_coff_symbol.name;
+                assert_eq!(bytes_of(archive_coff_symbol), bytes_of(&llvm_coff_symbol));
+            }
         } else {
             assert_eq!(
                 bytes_of(archive_member.header().unwrap()),
