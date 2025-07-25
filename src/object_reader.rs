@@ -7,8 +7,9 @@
 
 use std::{io, mem::offset_of};
 
-use object::{pe::ImportObjectHeader, xcoff, Object, ObjectSymbol};
+use object::{Object, ObjectSymbol, pe::ImportObjectHeader, xcoff};
 
+use crate::coff::is_any_arm64;
 use crate::coff_import_file;
 
 fn is_archive_symbol(sym: &object::read::Symbol<'_, '_>) -> bool {
@@ -65,6 +66,25 @@ pub fn is_ec_object(obj: &[u8]) -> bool {
             // version: u16
             // machine: u16
             u16::from_le_bytes([obj[6], obj[7]]) != object::pe::IMAGE_FILE_MACHINE_ARM64
+        }
+        _ => false,
+    }
+}
+
+pub fn is_any_arm64_coff(obj: &[u8]) -> bool {
+    match object::FileKind::parse(obj) {
+        Ok(object::FileKind::Coff) => u16::from_le_bytes([obj[0], obj[1]])
+            .try_into()
+            .is_ok_and(is_any_arm64),
+        Ok(object::FileKind::CoffImport) => {
+            // COFF Import Header is:
+            // sig1: u16
+            // sig2: u16
+            // version: u16
+            // machine: u16
+            u16::from_le_bytes([obj[6], obj[7]])
+                .try_into()
+                .is_ok_and(is_any_arm64)
         }
         _ => false,
     }

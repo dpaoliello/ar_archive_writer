@@ -4,25 +4,27 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Result, Seek, Write};
 use std::mem::{offset_of, size_of};
 use std::path::PathBuf;
 use std::str::from_utf8;
 
 use object::pe::{
-    ImageFileHeader, ImageImportDescriptor, ImageRelocation, ImageSectionHeader, ImageSymbol,
-    ImportObjectHeader, IMAGE_FILE_32BIT_MACHINE, IMAGE_REL_AMD64_ADDR32NB,
-    IMAGE_REL_ARM64_ADDR32NB, IMAGE_REL_ARM_ADDR32NB, IMAGE_REL_I386_DIR32NB,
-    IMAGE_SCN_ALIGN_2BYTES, IMAGE_SCN_ALIGN_4BYTES, IMAGE_SCN_ALIGN_8BYTES,
-    IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_LNK_INFO, IMAGE_SCN_LNK_REMOVE, IMAGE_SCN_MEM_READ,
-    IMAGE_SCN_MEM_WRITE, IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_NULL, IMAGE_SYM_CLASS_SECTION,
+    IMAGE_FILE_32BIT_MACHINE, IMAGE_REL_AMD64_ADDR32NB, IMAGE_REL_ARM_ADDR32NB,
+    IMAGE_REL_ARM64_ADDR32NB, IMAGE_REL_I386_DIR32NB, IMAGE_SCN_ALIGN_2BYTES,
+    IMAGE_SCN_ALIGN_4BYTES, IMAGE_SCN_ALIGN_8BYTES, IMAGE_SCN_CNT_INITIALIZED_DATA,
+    IMAGE_SCN_LNK_INFO, IMAGE_SCN_LNK_REMOVE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
+    IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_NULL, IMAGE_SYM_CLASS_SECTION,
     IMAGE_SYM_CLASS_STATIC, IMAGE_SYM_CLASS_WEAK_EXTERNAL, IMAGE_WEAK_EXTERN_SEARCH_ALIAS,
+    ImageFileHeader, ImageImportDescriptor, ImageRelocation, ImageSectionHeader, ImageSymbol,
+    ImportObjectHeader,
 };
 use object::pod::bytes_of;
 
-use crate::coff::{is_arm64ec, ImportNameType, ImportType, MachineTypes};
+use crate::coff::{ImportNameType, ImportType, MachineTypes, is_arm64ec};
 use crate::mangler::{get_arm64ec_demangled_function_name, get_arm64ec_mangled_function_name};
-use crate::{write_archive_to_stream, ArchiveKind, NewArchiveMember, DEFAULT_OBJECT_READER};
+use crate::{ArchiveKind, DEFAULT_OBJECT_READER, NewArchiveMember, write_archive_to_stream};
 
 pub(crate) const IMPORT_DESCRIPTOR_PREFIX: &[u8] = b"__IMPORT_DESCRIPTOR_";
 pub(crate) const NULL_IMPORT_DESCRIPTOR_SYMBOL_NAME: &[u8] = b"__NULL_IMPORT_DESCRIPTOR";
@@ -31,13 +33,13 @@ pub(crate) const NULL_THUNK_DATA_PREFIX: &[u8] = b"\x7f";
 pub(crate) const NULL_THUNK_DATA_SUFFIX: &[u8] = b"_NULL_THUNK_DATA";
 
 macro_rules! u16 {
-    ($val:expr) => {
+    ($val:expr_2021) => {
         object::U16::new(object::LittleEndian, $val)
     };
 }
 
 macro_rules! u32 {
-    ($val:expr) => {
+    ($val:expr_2021) => {
         object::U32::new(object::LittleEndian, $val)
     };
 }
@@ -111,9 +113,15 @@ pub struct COFFShortExport {
     /// "/export:foo=bar", this could be "_bar@8" if bar is stdcall.
     pub symbol_name: Option<String>,
 
-    /// Creates a weak alias. This is the name of the weak aliasee. In a .def
+    /// Creates an import library entry that imports from a DLL export with a
+    /// different name. This is the name of the DLL export that should be
+    /// referenced when linking against this import library entry. In a .def
     /// file, this is "baz" in "EXPORTS\nfoo = bar == baz".
-    pub alias_target: Option<String>,
+    pub import_name: Option<String>,
+
+    /// Specifies EXPORTAS name. In a .def file, this is "bar" in
+    /// "EXPORTS\nfoo EXPORTAS bar".
+    pub export_as: Option<String>,
 
     pub ordinal: u16,
     pub noname: bool,
@@ -126,6 +134,26 @@ fn set_name_to_string_table_entry(symbol: &mut ImageSymbol, offset: usize) {
     // If first 4 bytes are 0, then second 4 bytes are offset into string table.
     symbol.name[..4].copy_from_slice(&[0; 4]);
     symbol.name[4..].copy_from_slice(&u32::try_from(offset).unwrap().to_le_bytes());
+}
+
+fn apply_name_type(import_type: ImportNameType, name: &str) -> &str {
+    fn ltrim1<'a>(name: &'a str, chars: &str) -> &'a str {
+        if let Some((first_char, rest)) = name.split_at_checked(1)
+            && chars.contains(first_char)
+        {
+            return rest;
+        }
+        name
+    }
+
+    match import_type {
+        ImportNameType::NameNoprefix => ltrim1(name, "?@_"),
+        ImportNameType::NameUndecorate => {
+            let name = ltrim1(name, "?@_");
+            &name[..name.find('@').unwrap_or(name.len())]
+        }
+        _ => name,
+    }
 }
 
 fn get_img_rel_relocation(machine: MachineTypes) -> object::U16<object::LittleEndian> {
@@ -295,15 +323,19 @@ impl<'a> ObjectFactory<'a> {
                 virtual_size: u32!(0),
                 virtual_address: u32!(0),
                 size_of_raw_data: u32!(size_of::<ImageImportDescriptor>().try_into().unwrap()),
-                pointer_to_raw_data: u32!((size_of::<ImageFileHeader>()
-                    + NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>())
-                .try_into()
-                .unwrap()),
-                pointer_to_relocations: u32!((size_of::<ImageFileHeader>()
-                    + NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>()
-                    + size_of::<ImageImportDescriptor>())
-                .try_into()
-                .unwrap()),
+                pointer_to_raw_data: u32!(
+                    (size_of::<ImageFileHeader>()
+                        + NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>())
+                    .try_into()
+                    .unwrap()
+                ),
+                pointer_to_relocations: u32!(
+                    (size_of::<ImageFileHeader>()
+                        + NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>()
+                        + size_of::<ImageImportDescriptor>())
+                    .try_into()
+                    .unwrap()
+                ),
                 pointer_to_linenumbers: u32!(0),
                 number_of_relocations: u16!(NUMBER_OF_RELOCATIONS.try_into().unwrap()),
                 number_of_linenumbers: u16!(0),
@@ -319,12 +351,14 @@ impl<'a> ObjectFactory<'a> {
                 virtual_size: u32!(0),
                 virtual_address: u32!(0),
                 size_of_raw_data: u32!((self.import_name.len() + 1).try_into().unwrap()),
-                pointer_to_raw_data: u32!((size_of::<ImageFileHeader>()
-                    + NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>()
-                    + size_of::<ImageImportDescriptor>()
-                    + NUMBER_OF_RELOCATIONS * size_of::<ImageRelocation>())
-                .try_into()
-                .unwrap()),
+                pointer_to_raw_data: u32!(
+                    (size_of::<ImageFileHeader>()
+                        + NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>()
+                        + size_of::<ImageImportDescriptor>()
+                        + NUMBER_OF_RELOCATIONS * size_of::<ImageRelocation>())
+                    .try_into()
+                    .unwrap()
+                ),
                 pointer_to_relocations: u32!(0),
                 pointer_to_linenumbers: u32!(0),
                 number_of_relocations: u16!(0),
@@ -351,23 +385,29 @@ impl<'a> ObjectFactory<'a> {
 
         let relocation_table: [_; NUMBER_OF_RELOCATIONS] = [
             ImageRelocation {
-                virtual_address: u32!((offset_of!(ImageImportDescriptor, name))
-                    .try_into()
-                    .unwrap()),
+                virtual_address: u32!(
+                    (offset_of!(ImageImportDescriptor, name))
+                        .try_into()
+                        .unwrap()
+                ),
                 symbol_table_index: u32!(2),
                 typ: get_img_rel_relocation(self.native_machine),
             },
             ImageRelocation {
-                virtual_address: u32!(offset_of!(ImageImportDescriptor, original_first_thunk)
-                    .try_into()
-                    .unwrap()),
+                virtual_address: u32!(
+                    offset_of!(ImageImportDescriptor, original_first_thunk)
+                        .try_into()
+                        .unwrap()
+                ),
                 symbol_table_index: u32!(3),
                 typ: get_img_rel_relocation(self.native_machine),
             },
             ImageRelocation {
-                virtual_address: u32!(offset_of!(ImageImportDescriptor, first_thunk)
-                    .try_into()
-                    .unwrap()),
+                virtual_address: u32!(
+                    offset_of!(ImageImportDescriptor, first_thunk)
+                        .try_into()
+                        .unwrap()
+                ),
                 symbol_table_index: u32!(4),
                 typ: get_img_rel_relocation(self.native_machine),
             },
@@ -504,10 +544,12 @@ impl<'a> ObjectFactory<'a> {
             virtual_size: u32!(0),
             virtual_address: u32!(0),
             size_of_raw_data: u32!(size_of::<ImageImportDescriptor>().try_into().unwrap()),
-            pointer_to_raw_data: u32!((size_of::<ImageFileHeader>()
-                + NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>())
-            .try_into()
-            .unwrap()),
+            pointer_to_raw_data: u32!(
+                (size_of::<ImageFileHeader>()
+                    + NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>())
+                .try_into()
+                .unwrap()
+            ),
             pointer_to_relocations: u32!(0),
             pointer_to_linenumbers: u32!(0),
             number_of_relocations: u16!(0),
@@ -595,10 +637,12 @@ impl<'a> ObjectFactory<'a> {
                 virtual_size: u32!(0),
                 virtual_address: u32!(0),
                 size_of_raw_data: u32!(va_size.try_into().unwrap()),
-                pointer_to_raw_data: u32!((size_of::<ImageFileHeader>()
-                    + NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>())
-                .try_into()
-                .unwrap()),
+                pointer_to_raw_data: u32!(
+                    (size_of::<ImageFileHeader>()
+                        + NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>())
+                    .try_into()
+                    .unwrap()
+                ),
                 pointer_to_relocations: u32!(0),
                 pointer_to_linenumbers: u32!(0),
                 number_of_relocations: u16!(0),
@@ -615,11 +659,13 @@ impl<'a> ObjectFactory<'a> {
                 virtual_size: u32!(0),
                 virtual_address: u32!(0),
                 size_of_raw_data: u32!(va_size.try_into().unwrap()),
-                pointer_to_raw_data: u32!((size_of::<ImageFileHeader>()
-                    + NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>()
-                    + va_size)
-                    .try_into()
-                    .unwrap()),
+                pointer_to_raw_data: u32!(
+                    (size_of::<ImageFileHeader>()
+                        + NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>()
+                        + va_size)
+                        .try_into()
+                        .unwrap()
+                ),
                 pointer_to_relocations: u32!(0),
                 pointer_to_linenumbers: u32!(0),
                 number_of_relocations: u16!(0),
@@ -728,10 +774,12 @@ impl<'a> ObjectFactory<'a> {
             machine: u16!(machine.into()),
             number_of_sections: u16!(NUMBER_OF_SECTIONS.try_into().unwrap()),
             time_date_stamp: u32!(0),
-            pointer_to_symbol_table: u32!((size_of::<ImageFileHeader>()
-                + (NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>()))
-            .try_into()
-            .unwrap()),
+            pointer_to_symbol_table: u32!(
+                (size_of::<ImageFileHeader>()
+                    + (NUMBER_OF_SECTIONS * size_of::<ImageSectionHeader>()))
+                .try_into()
+                .unwrap()
+            ),
             number_of_symbols: u32!(NUMBER_OF_SYMBOLS.try_into().unwrap()),
             size_of_optional_header: u16!(0),
             characteristics: u16!(0),
@@ -831,15 +879,27 @@ impl<'a> ObjectFactory<'a> {
     }
 }
 
+/// Writes a COFF import library containing entries described by the Exports
+/// array.
+///
+/// For hybrid targets such as ARM64EC, additional native entry points can be
+/// exposed using the NativeExports parameter. When NativeExports is used, the
+/// output import library will expose these native ARM64 imports alongside the
+/// entries described in the Exports array. Such a library can be used for
+/// linking both ARM64EC and pure ARM64 objects, and the linker will pick only
+/// the exports relevant to the target platform. For non-hybrid targets,
+/// the NativeExports parameter should not be used.
 pub fn write_import_library<W: Write + Seek>(
     w: &mut W,
     import_name: &str,
     exports: &[COFFShortExport],
-    machine: MachineTypes,
+    mut machine: MachineTypes,
     mingw: bool,
     whole_archive_compat: bool,
+    native_exports: &[COFFShortExport],
 ) -> Result<()> {
-    let native_machine = if machine == MachineTypes::ARM64EC {
+    let native_machine = if is_arm64ec(machine) {
+        machine = MachineTypes::ARM64EC;
         MachineTypes::ARM64
     } else {
         machine
@@ -854,79 +914,150 @@ pub fn write_import_library<W: Write + Seek>(
 
     members.push(of.create_null_thunk()?);
 
-    for e in exports {
-        if e.private {
-            continue;
+    let mut add_exports = |exports: &[COFFShortExport], machine_type: MachineTypes| -> Result<()> {
+        struct Deferred<'a> {
+            name: String,
+            import_type: ImportType,
+            export: &'a COFFShortExport,
         }
-
-        let mut import_type = ImportType::Code;
-        if e.data {
-            import_type = ImportType::Data;
-        }
-        if e.constant {
-            import_type = ImportType::Const;
-        }
-
-        let symbol_name = if let Some(symbol_name) = e.symbol_name.as_ref() {
-            symbol_name
-        } else {
-            &e.name
-        };
-
-        let mut name: Cow<'_, str> = if let Some(ext_name) = e.ext_name.as_ref() {
-            Cow::Owned(replace(symbol_name, &e.name, ext_name)?)
-        } else {
-            Cow::Borrowed(symbol_name)
-        };
-
-        if let Some(alias_target) = e.alias_target.as_ref() {
-            if name.as_ref() != alias_target {
-                members.push(of.create_weak_external(alias_target, &name, false, machine)?);
-                members.push(of.create_weak_external(alias_target, &name, true, machine)?);
+        // Determinism: Safe to use HashMap here as we never iterate over it.
+        let mut regular_imports = HashMap::new();
+        let mut renames = Vec::new();
+        for e in exports {
+            if e.private {
                 continue;
             }
+
+            let mut import_type = ImportType::Code;
+            if e.data {
+                import_type = ImportType::Data;
+            }
+            if e.constant {
+                import_type = ImportType::Const;
+            }
+
+            let symbol_name = if let Some(symbol_name) = e.symbol_name.as_ref() {
+                symbol_name
+            } else {
+                &e.name
+            };
+
+            let mut name: Cow<'_, str> = if let Some(ext_name) = e.ext_name.as_ref() {
+                Cow::Owned(replace(symbol_name, &e.name, ext_name)?)
+            } else {
+                Cow::Borrowed(symbol_name)
+            };
+
+            let mut export_name = None;
+            let mut name_type = if e.noname {
+                ImportNameType::Ordinal
+            } else if let Some(export_as) = e.export_as.as_deref() {
+                export_name = Some(Cow::Borrowed(export_as));
+                ImportNameType::NameExportas
+            } else if let Some(import_name) = e.import_name.as_deref() {
+                // If we need to import from a specific ImportName, we may need to use
+                // a weak alias (which needs another import to point at). But if we can
+                // express ImportName based on the symbol name and a specific NameType,
+                // prefer that over an alias.
+                if machine_type == MachineTypes::I386
+                    && apply_name_type(ImportNameType::NameUndecorate, &name) == import_name
+                {
+                    ImportNameType::NameUndecorate
+                } else if machine_type == MachineTypes::I386
+                    && apply_name_type(ImportNameType::NameNoprefix, &name) == import_name
+                {
+                    ImportNameType::NameNoprefix
+                } else if is_arm64ec(machine_type) {
+                    export_name = Some(Cow::Borrowed(import_name));
+                    ImportNameType::NameExportas
+                } else if name == import_name {
+                    ImportNameType::Name
+                } else {
+                    renames.push(Deferred {
+                        name: name.into_owned(),
+                        import_type,
+                        export: e,
+                    });
+                    continue;
+                }
+            } else {
+                get_name_type(symbol_name, &e.name, machine_type, mingw)
+            };
+
+            // On ARM64EC, use EXPORTAS to import demangled name for mangled symbols.
+            if import_type == ImportType::Code && crate::coff::is_arm64ec(machine_type) {
+                match get_arm64ec_mangled_function_name(&name) {
+                    Ok(Some(mangled_name)) => {
+                        if !e.noname && export_name.is_none() {
+                            name_type = ImportNameType::NameExportas;
+                            export_name = Some(name);
+                        }
+                        name = Cow::Owned(mangled_name);
+                    }
+                    Ok(None) if !e.noname && export_name.is_none() => {
+                        let demangled_name = get_arm64ec_demangled_function_name(&name)
+                            .ok_or_else(|| {
+                                Error::other(format!("Invalid ARM64EC function name \"{name}\""))
+                            })?;
+                        name_type = ImportNameType::NameExportas;
+                        export_name = Some(Cow::Owned(demangled_name));
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        return Err(Error::other(format!(
+                            "Functions on Arm64EC must use the Arm64EC mangling scheme, but the function \"{name}\" does not."
+                        )));
+                    }
+                }
+            }
+
+            let key = apply_name_type(name_type, &name).to_string();
+            regular_imports.insert(key, name.to_string());
+            members.push(of.create_short_import(
+                name.as_ref(),
+                e.ordinal,
+                import_type,
+                name_type,
+                export_name.as_deref(),
+                machine_type,
+            )?);
+        }
+        for d in renames {
+            if let Some(symbol) = d
+                .export
+                .import_name
+                .as_ref()
+                .and_then(|import_name| regular_imports.get(import_name.as_str()))
+            {
+                // We have a regular import entry for a symbol with the name we
+                // want to reference; produce an alias pointing at that.
+                if d.import_type == ImportType::Code {
+                    members.push(of.create_weak_external(symbol, &d.name, false, machine_type)?);
+                }
+                members.push(of.create_weak_external(symbol, &d.name, true, machine_type)?);
+            } else {
+                members.push(of.create_short_import(
+                    &d.name,
+                    d.export.ordinal,
+                    d.import_type,
+                    ImportNameType::NameExportas,
+                    d.export.import_name.as_deref(),
+                    machine_type,
+                )?);
+            }
         }
 
-        let mut name_type = if e.noname {
-            ImportNameType::Ordinal
-        } else {
-            get_name_type(symbol_name, &e.name, machine, mingw)
-        };
+        Ok(())
+    };
 
-        // On ARM64EC, use EXPORTAS to import demangled name for mangled symbols.
-        let export_name = if import_type == ImportType::Code && crate::coff::is_arm64ec(machine) {
-            if let Some(mangled_name) = get_arm64ec_mangled_function_name(&name) {
-                name_type = ImportNameType::NameExportas;
-                let export_name = name;
-                name = Cow::Owned(mangled_name);
-                Some(export_name)
-            } else {
-                name_type = ImportNameType::NameExportas;
-                get_arm64ec_demangled_function_name(&name).map(Cow::Owned)
-            }
-        } else {
-            None
-        };
-
-        members.push(of.create_short_import(
-            &name,
-            e.ordinal,
-            import_type,
-            name_type,
-            export_name.as_deref(),
-            machine,
-        )?);
-    }
+    add_exports(exports, machine)?;
+    add_exports(native_exports, native_machine)?;
 
     write_archive_to_stream(
         w,
         &members,
-        if mingw {
-            ArchiveKind::Gnu
-        } else {
-            ArchiveKind::Coff
-        },
+        ArchiveKind::Coff,
         false,
-        is_arm64ec(machine),
+        Some(is_arm64ec(machine)),
     )
 }

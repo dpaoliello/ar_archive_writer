@@ -2,11 +2,11 @@
 // https://github.com/gimli-rs/object/blob/0.35.0/tests/round_trip/mod.rs
 
 use ar_archive_writer::ArchiveKind;
-use object::{read, write, RelocationFlags, SubArchitecture};
 use object::{
     Architecture, BinaryFormat, Endianness, RelocationEncoding, RelocationKind, SymbolFlags,
     SymbolKind, SymbolScope,
 };
+use object::{RelocationFlags, SubArchitecture, read, write};
 use pretty_assertions::assert_eq;
 
 mod common;

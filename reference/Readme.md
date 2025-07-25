@@ -15,6 +15,7 @@ These files were originally located at:
 * `llvm/lib/IR/Mangler.cpp`
 * `llvm/lib/Object/ArchiveWriter.cpp`
 * `llvm/lib/Object/COFFImportFile.cpp`
+* `llvm/unittests/IR/ManglerTest.cpp`
 
 When syncing, make sure to update these files and the commit above.
 
