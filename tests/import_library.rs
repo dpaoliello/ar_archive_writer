@@ -8,7 +8,7 @@ use common::{create_archive_with_ar_archive_writer, create_archive_with_llvm_ar}
 use object::coff::CoffFile;
 use object::pe::ImageFileHeader;
 use object::read::archive::ArchiveFile;
-use object::{bytes_of, Architecture, Object, ObjectSection, ObjectSymbol, SubArchitecture};
+use object::{Architecture, Object, ObjectSection, ObjectSymbol, SubArchitecture, bytes_of};
 use pretty_assertions::assert_eq;
 
 mod common;
@@ -17,7 +17,8 @@ const DEFAULT_EXPORT: COFFShortExport = COFFShortExport {
     name: String::new(),
     ext_name: None,
     symbol_name: None,
-    alias_target: None,
+    export_as: None,
+    import_name: None,
     ordinal: 0,
     noname: false,
     data: false,
@@ -79,19 +80,43 @@ fn get_members(machine_type: MachineTypes) -> Vec<COFFShortExport> {
         },
         COFFShortExport {
             name: format!("{prefix}FuncWithImportName"),
-            alias_target: Some(format!("{prefix}ImportName")),
+            import_name: Some("ImportName".to_string()),
             ..DEFAULT_EXPORT
         },
         COFFShortExport {
-            name: "?CppFunc@SingleAt".to_string(),
+            name: "?foo@@$$hYAHXZ".to_string(),
             ..DEFAULT_EXPORT
         },
         COFFShortExport {
-            name: "?CppFunc@@DoubleAt".to_string(),
+            name: "?GetValue@?$Wrapper@UA@@@@$$hQEBAHXZ".to_string(),
             ..DEFAULT_EXPORT
         },
         COFFShortExport {
-            name: "?CppFunc@@@TripleAt".to_string(),
+            name: "??2@$$hYAPEAX_K@Z".to_string(),
+            ..DEFAULT_EXPORT
+        },
+        COFFShortExport {
+            name: "?f@Base@D@C@B@A@@$$hUEAAHXZ".to_string(),
+            ..DEFAULT_EXPORT
+        },
+        COFFShortExport {
+            name: "??0Base@D@C@B@A@@$$hQEAA@XZ".to_string(),
+            ..DEFAULT_EXPORT
+        },
+        COFFShortExport {
+            name: "?f@Derived@@$$hUEAAHXZ".to_string(),
+            ..DEFAULT_EXPORT
+        },
+        COFFShortExport {
+            name: "??0Derived@@$$hQEAA@XZ".to_string(),
+            ..DEFAULT_EXPORT
+        },
+        COFFShortExport {
+            name: "?MakeObj@@$$hYAPEAUBase@D@C@B@A@@XZ".to_string(),
+            ..DEFAULT_EXPORT
+        },
+        COFFShortExport {
+            name: "?GetValue@?$Wrapper@UA@@@@$$hQEBAHUZ@?$WW@UA@@@@@Z".to_string(),
             ..DEFAULT_EXPORT
         },
     ]
@@ -111,6 +136,7 @@ fn create_import_library_with_ar_archive_writer(
         machine_type,
         mingw,
         comdat,
+        &[],
     )
     .unwrap();
 
@@ -256,6 +282,7 @@ fn wrap_in_archive() {
             machine_type,
             false,
             false,
+            &[],
         )
         .unwrap();
         let import_lib_bytes = import_lib_bytes.into_inner();
@@ -332,10 +359,12 @@ fn compare_comdat(archive_writer_bytes: &[u8], llvm_bytes: &[u8]) {
             }
             for (archive_symbol, llvm_symbol) in archive_file.symbols().zip(llvm_file.symbols()) {
                 if llvm_symbol.name().unwrap() == "__NULL_IMPORT_DESCRIPTOR" {
-                    assert!(archive_symbol
-                        .name()
-                        .unwrap()
-                        .starts_with("__NULL_IMPORT_DESCRIPTOR_"));
+                    assert!(
+                        archive_symbol
+                            .name()
+                            .unwrap()
+                            .starts_with("__NULL_IMPORT_DESCRIPTOR_")
+                    );
                 } else {
                     assert_eq!(archive_symbol.name(), llvm_symbol.name());
                 }

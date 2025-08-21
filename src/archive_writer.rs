@@ -9,11 +9,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Cursor, Seek, Write};
 use std::mem::size_of;
 
+use crate::ObjectReader;
 use crate::alignment::*;
 use crate::archive::*;
 use crate::coff_import_file;
 use crate::math_extras::align_to_power_of2;
-use crate::ObjectReader;
 
 const BIG_AR_MEM_HDR_SIZE: u64 = {
     // `try_into` is not const, so check the size manually.
@@ -126,9 +126,9 @@ fn print_bsd_member_header<W: Write>(
     // Pad so that even 64 bit object files are aligned.
     let pad = offset_to_alignment(pos_after_header, 8);
     let name_with_padding = u64::try_from(name.len()).unwrap() + pad;
-    write!(w, "#1/{:<13}", name_with_padding)?;
+    write!(w, "#1/{name_with_padding:<13}")?;
     print_rest_of_member_header(w, mtime, uid, gid, perms, name_with_padding + size)?;
-    write!(w, "{}", name)?;
+    write!(w, "{name}")?;
     write!(
         w,
         "{nil:\0<pad$}",
@@ -162,7 +162,7 @@ fn print_big_archive_member_header<W: Write>(
     )?;
 
     if !name.is_empty() {
-        write!(w, "{}", name)?;
+        write!(w, "{name}")?;
 
         if name.len() % 2 != 0 {
             write!(w, "\0")?;
@@ -229,7 +229,7 @@ fn print_member_header<'m, W: Write, T: Write + Seek>(
             write!(string_table, "/\n")?;
         }
     }
-    write!(w, "{:<15}", name_pos)?;
+    write!(w, "{name_pos:<15}")?;
     print_rest_of_member_header(w, mtime, m.uid, m.gid, m.perms, size)
 }
 
@@ -538,7 +538,7 @@ fn write_ec_symbols<W: Write + Seek>(w: &mut W, sym_map: &SymMap) -> io::Result<
     Ok(())
 }
 
-// NOTE: isECObject was moved to object_reader.rs
+// NOTE: isECObject and isAnyArm64COFF was moved to object_reader.rs
 
 fn is_import_descriptor(name: &[u8]) -> bool {
     name.starts_with(coff_import_file::IMPORT_DESCRIPTOR_PREFIX)
@@ -588,10 +588,10 @@ fn write_symbols(
 
                 // If EC is enabled, then the import descriptors are NOT put into EC
                 // objects so we need to copy them to the EC map manually.
-                if let Some(ec_map) = &mut ec_map {
-                    if is_import_descriptor(name) {
-                        ec_map.insert(name.to_vec().into_boxed_slice(), index);
-                    }
+                if let Some(ec_map) = &mut ec_map
+                    && is_import_descriptor(name)
+                {
+                    ec_map.insert(name.to_vec().into_boxed_slice(), index);
                 }
             }
         } else {
@@ -611,6 +611,7 @@ fn compute_member_data<'a, S: Write + Seek>(
     thin: bool,
     sym_map: &mut Option<&mut SymMap>,
     new_members: &'a [NewArchiveMember<'a>],
+    is_ec: Option<bool>,
 ) -> io::Result<Vec<MemberData<'a>>> {
     const PADDING_DATA: &[u8; 8] = &[b'\n'; 8];
 
@@ -683,6 +684,31 @@ fn compute_member_data<'a, S: Write + Seek>(
         }
     }
 
+    if let Some(sym_map) = sym_map {
+        if let Some(is_ec) = is_ec {
+            sym_map.use_ec_map = is_ec;
+        } else {
+            // When IsEC is not specified by the caller, use it when we have both
+            // any ARM64 object (ARM64 or ARM64EC) and any EC object (ARM64EC or
+            // AMD64). This may be a single ARM64EC object, but may also be separate
+            // ARM64 and AMD64 objects.
+            let mut have_arm64 = false;
+            let mut have_ec = false;
+            for m in new_members {
+                if !have_arm64 {
+                    have_arm64 = (m.object_reader.is_any_arm64_coff)(m.buf.as_ref().as_ref());
+                }
+                if !have_ec {
+                    have_ec = (m.object_reader.is_ec_object_file)(m.buf.as_ref().as_ref());
+                }
+                if have_arm64 && have_ec {
+                    sym_map.use_ec_map = true;
+                    break;
+                }
+            }
+        }
+    }
+
     // The big archive format needs to know the offset of the previous member
     // header.
     let mut prev_offset = 0;
@@ -719,10 +745,10 @@ fn compute_member_data<'a, S: Write + Seek>(
 
         let size = u64::try_from(buf.len()).unwrap() + member_padding;
         if size > MAX_MEMBER_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Archive member {} is too big", m.member_name),
-            ));
+            return Err(io::Error::other(format!(
+                "Archive member {} is too big",
+                m.member_name
+            )));
         }
 
         // In the big archive file format, we need to calculate and include the next
@@ -822,7 +848,7 @@ pub fn write_archive_to_stream<'a, W: Write + Seek>(
     new_members: &'a [NewArchiveMember<'a>],
     mut kind: ArchiveKind,
     thin: bool,
-    is_ec: bool,
+    is_ec: Option<bool>,
 ) -> io::Result<()> {
     assert!(
         !thin || !is_bsd_like(kind),
@@ -839,7 +865,6 @@ pub fn write_archive_to_stream<'a, W: Write + Seek>(
         kind = ArchiveKind::Gnu;
     }
 
-    sym_map.use_ec_map = is_ec;
     let data = compute_member_data(
         &mut string_table,
         &mut sym_names,
@@ -847,6 +872,7 @@ pub fn write_archive_to_stream<'a, W: Write + Seek>(
         thin,
         &mut is_coff_archive(kind).then_some(&mut sym_map),
         new_members,
+        is_ec,
     )?;
 
     let sym_names = sym_names.into_inner();
@@ -1074,8 +1100,8 @@ pub fn write_archive_to_stream<'a, W: Write + Seek>(
         )?;
         // If there are no file members in the archive, there will be no global
         // symbol table.
-        write!(w, "{:<20}", global_symbol_offset)?;
-        write!(w, "{:<20}", global_symbol_offset64)?;
+        write!(w, "{global_symbol_offset:<20}")?;
+        write!(w, "{global_symbol_offset64:<20}")?;
         // Offset to first archive member
         write!(
             w,
@@ -1133,7 +1159,7 @@ pub fn write_archive_to_stream<'a, W: Write + Seek>(
             )?;
             write!(w, "{:<20}", member_offsets.len())?; // Number of members
             for member_offset in member_offsets {
-                write!(w, "{:<20}", member_offset)?;
+                write!(w, "{member_offset:<20}")?;
             }
             for member_name in member_names {
                 w.write_all(member_name.as_bytes())?;

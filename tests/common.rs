@@ -19,7 +19,7 @@ pub fn create_tmp_dir(test_name: &str) -> PathBuf {
         Ok(_) => {}
         Err(err) => {
             if err.kind() != std::io::ErrorKind::NotFound {
-                panic!("Failed to delete directory: {:?}", tmpdir);
+                panic!("Failed to delete directory: {tmpdir:?}");
             }
         }
     }
@@ -82,9 +82,9 @@ fn run_llvm_ar(
             ArchiveKind::AixBig => "bigarchive",
             ArchiveKind::Darwin => "darwin",
             ArchiveKind::Gnu => "gnu",
-            _ => panic!("unsupported archive kind: {:?}", archive_kind),
+            _ => panic!("unsupported archive kind: {archive_kind:?}"),
         };
-        command.arg(format!("--format={}", format_arg));
+        command.arg(format!("--format={format_arg}"));
 
         if thin {
             command.arg("--thin");
@@ -180,7 +180,7 @@ pub fn create_archive_with_ar_archive_writer<'name, 'data>(
         &members,
         archive_kind,
         thin,
-        is_ec,
+        Some(is_ec),
     )
     .unwrap();
 

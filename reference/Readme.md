@@ -3,7 +3,7 @@
 These are a copy of the relevant LLVM files that were ported to Rust from the
 last time that this project was "synced" with LLVM.
 
-Currently that sync point is 18.1.3, commit [ef6d1ec](https://github.com/llvm/llvm-project/tree/ef6d1ec07c693352c4a60dd58db08d2d8558f6ea).
+Currently that sync point is 20.1.8, commit [87f0227](https://github.com/llvm/llvm-project/tree/87f0227cb60147a26a1eeb4fb06e3b505e9c7261).
 
 These files were originally located at:
 * `llvm/include/llvm/BinaryFormat/COFF.h`
@@ -15,6 +15,7 @@ These files were originally located at:
 * `llvm/lib/IR/Mangler.cpp`
 * `llvm/lib/Object/ArchiveWriter.cpp`
 * `llvm/lib/Object/COFFImportFile.cpp`
+* `llvm/unittests/IR/ManglerTest.cpp`
 
 When syncing, make sure to update these files and the commit above.
 
